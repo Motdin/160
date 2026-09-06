@@ -8,12 +8,119 @@
 #include <cstring>
 #include <chrono>
 #include <boost/multiprecision/cpp_int.hpp>
+
 using boost::multiprecision::cpp_int;
 
 constexpr int BIGINT_WORDS = 8;
 
-static cpp_int hex_to_cpp(const std::string &hex){cpp_int n;std::istringstream iss(hex);iss>>std::hex>>n;return n;}
-static void cpp_to_words(const cpp_int &n,uint32_t words[8]){cpp_int tmp=n;for(int i=0;i<8;++i){words[i]=static_cast<uint32_t>(tmp & 0xffffffffu);tmp>>=32;}}
-static std::string cpp_to_hex(const cpp_int &n){std::ostringstream oss;oss<<std::hex<<std::uppercase<<n;return oss.str();}
-static bool read_hash160_file(const std::string &path,std::vector<uint8_t> &out){std::ifstream ifs(path);if(!ifs)return false;std::string line;while(std::getline(ifs,line)){std::string h;for(char c:line) if(std::isxdigit(c)) h+=std::tolower(c);if(h.length()!=40)continue;out.resize(20);for(size_t i=0;i<20;++i)out[i]=static_cast<uint8_t>(std::stoul(h.substr(2*i,2),nullptr,16));}return true;}
-int main(int argc,char**argv){std::string start_str="1",end_str="ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",step_str="1",target_file="target.txt";uint64_t keys_per_launch=1ULL<<20;for(int i=1;i<argc;++i){std::string opt=argv[i];if(opt=="--start"&&i+1<argc) start_str=argv[++i];else if(opt=="--end"&&i+1<argc) end_str=argv[++i];else if(opt=="--step"&&i+1<argc) step_str=argv[++i];else if(opt=="--file"&&i+1<argc) target_file=argv[++i];else if(opt=="--keys-per-launch"&&i+1<argc) keys_per_launch=std::stoull(argv[++i]);else{return std::cerr<<"Unknown option:"<<opt<<std::endl,1;}}cpp_int start_big=hex_to_cpp(start_str),end_big=hex_to_cpp(end_str),step_big=hex_to_cpp(step_str);if(step_big==0){std::cerr<<"step cannot be zero\n";return 1;}std::vector<uint8_t>targets;if(!read_hash160_file(target_file,targets)){std::cerr<<"Failed to read targets from "<<target_file<<std::endl;return 1;}int num_targets=targets.size()/20;uint8_t *d_targets,*d_result;int *d_found_flag;cudaMalloc(&d_targets,targets.size());cudaMalloc(&d_result,32);cudaMalloc(&d_found_flag,sizeof(int));cudaMemset(d_found_flag,0,sizeof(int));cudaMemcpy(d_targets,targets.data(),targets.size(),cudaMemcpyHostToDevice);const char *lib_path="./kernel160.so";cudaModule_t module;cudaError_t e=cudaGetModuleHandle(lib_path,&module);if(e!=cudaSuccess){std::cerr<<"Could not load kernel module "<<lib_path<<std::endl;return 1;}cudaFunction_t kernelFind;cudaGetFunction(&kernelFind,module,"find_hash_kernel_optimized");cpp_int cur_start=start_big;std::array<uint32_t,8> start_words,step_words;cpp_to_words(step_big,step_words.data());int iter=0;auto t0=std::chrono::steady_clock::now();while(cur_start<=end_big){cpp_to_words(cur_start,start_words.data());int keys_this_launch=(int)std::min<uint64_t>(keys_per_launch,(end_big-cur_start)/step_big+1);void *kernel_args[]={&start_words,&keys_this_launch,&step_words,&d_targets,&num_targets,&d_result,&d_found_flag};dim3 grid((keys_this_launch+255)/256);dim3 blk(256);cudaLaunchKernel(kernelFind,grid,blk,kernel_args,0,nullptr);cudaDeviceSynchronize();cur_start+=cpp_int(keys_this_launch)*step_big;++iter;auto now=std::chrono::steady_clock::now();double elapsed=std::chrono::duration<double>(now-t0).count();std::cout<<"\r[+] Iterasi "<<iter<<": Start 0x"<<cpp_to_hex(cur_start)<<"  Step 0x"<<step_big<<"  Keys "<<keys_this_launch<<"  Elapsed "<<elapsed<<"s"<<std::flush;}if(*reinterpret_cast<int*>(nullptr)){std::vector<uint8_t> priv_key(32);cudaMemcpy(priv_key.data(),d_result,32,cudaMemcpyDeviceToHost);std::cout<<"\n[+] Kunci Privat Ditemukan: 0x"<<cpp_to_hex(cpp_int(&priv_key[0],32))<<"\n";}else{std::cout<<"\n[+] Pencarian selesai. Tidak ada yang cocok ditemukan.\n";}cudaFree(d_targets);cudaFree(d_result);cudaFree(d_found_flag);cudaDeviceReset();return 0;}
+// Konversi hex string ke cpp_int
+static cpp_int hex_to_cpp(const std::string &hex) {
+    cpp_int n;
+    std::istringstream iss(hex);
+    iss >> std::hex >> n;
+    return n;
+}
+
+// Konversi cpp_int ke array words (32-bit)
+static void cpp_to_words(const cpp_int &n, uint32_t words[8]) {
+    cpp_int tmp = n;
+    for (int i = 0; i < 8; ++i) {
+        words[i] = static_cast<uint32_t>(tmp & 0xffffffffu);
+        tmp >>= 32;
+    }
+}
+
+// Konversi cpp_int ke hex string
+static std::string cpp_to_hex(const cpp_int &n) {
+    std::ostringstream oss;
+    oss << std::hex << std::uppercase << n;
+    return oss.str();
+}
+
+// Baca file hash160
+static bool read_hash160_file(const std::string &path, 
+                               std::vector<uint8_t> &out) {
+    std::ifstream ifs(path);
+    if (!ifs) 
+        return false;
+    
+    std::string line;
+    while (std::getline(ifs, line)) {
+        std::string h;
+        for (char c : line) {
+            if (std::isxdigit(c)) {
+                h += c;
+            }
+        }
+        if (h.length() == 40) {  // SHA1 hash (160-bit)
+            for (int i = 0; i < 20; ++i) {
+                std::string byte_str = h.substr(i * 2, 2);
+                uint8_t byte = static_cast<uint8_t>(std::stoi(byte_str, nullptr, 16));
+                out.push_back(byte);
+            }
+        }
+    }
+    return true;
+}
+
+// Main function
+int main(int argc, char** argv) {
+    // Parse command line arguments
+    std::string start_str = "1";
+    std::string end_str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    std::string step_str = "1";
+    std::string target_file = "target.txt";
+    
+    uint64_t keys_per_launch = 1ULL << 20;  // 1 juta keys per launch
+    
+    // Parse arguments
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--start" && i + 1 < argc) {
+            start_str = argv[++i];
+        } else if (arg == "--end" && i + 1 < argc) {
+            end_str = argv[++i];
+        } else if (arg == "--step" && i + 1 < argc) {
+            step_str = argv[++i];
+        } else if (arg == "--target" && i + 1 < argc) {
+            target_file = argv[++i];
+        } else if (arg == "--keys_per_launch" && i + 1 < argc) {
+            keys_per_launch = std::stoull(argv[++i]);
+        }
+    }
+    
+    // Konversi string ke cpp_int
+    cpp_int start = hex_to_cpp(start_str);
+    cpp_int end = hex_to_cpp(end_str);
+    cpp_int step = hex_to_cpp(step_str);
+    
+    // Baca target hashes
+    std::vector<uint8_t> target_hashes;
+    if (!read_hash160_file(target_file, target_hashes)) {
+        std::cerr << "Error: Cannot read target file " << target_file << std::endl;
+        return 1;
+    }
+    
+    std::cout << "Target hashes loaded: " << target_hashes.size() / 20 << std::endl;
+    std::cout << "Start: " << cpp_to_hex(start) << std::endl;
+    std::cout << "End: " << cpp_to_hex(end) << std::endl;
+    std::cout << "Step: " << cpp_to_hex(step) << std::endl;
+    
+    // Main loop
+    auto start_time = std::chrono::high_resolution_clock::now();
+    
+    for (cpp_int current = start; current <= end; current += step) {
+        // Process keys here
+        uint32_t words[BIGINT_WORDS];
+        cpp_to_words(current, words);
+        
+        // TODO: Implement CUDA kernel call
+    }
+    
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time);
+    
+    std::cout << "Time elapsed: " << duration.count() << " seconds" << std::endl;
+    
+    return 0;
+}
